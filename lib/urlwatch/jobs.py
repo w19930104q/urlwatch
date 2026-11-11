@@ -205,7 +205,7 @@ class JobBase(object, metaclass=TrackSubClasses):
 
 class Job(JobBase):
     __required__ = ()
-    __optional__ = ('name', 'filter', 'max_tries', 'diff_tool', 'compared_versions', 'diff_filter', 'enabled', 'treat_new_as_changed', 'user_visible_url', 'tags')
+    __optional__ = ('name', 'filter', 'max_tries', 'diff_tool', 'compared_versions', 'diff_filter', 'enabled', 'treat_new_as_changed', 'user_visible_url', 'tags', 'filter_config_baselines')
 
     def matching_tags(self, tags: Iterable[str]) -> Set[str]:
         return self.tags.intersection(tags)
@@ -308,17 +308,21 @@ class UrlJob(Job):
             'https': os.getenv('HTTPS_PROXY'),
         }
 
-        if job_state.etag is not None:
-            headers['If-None-Match'] = job_state.etag
-
-        if job_state.timestamp is not None:
-            headers['If-Modified-Since'] = email.utils.formatdate(job_state.timestamp)
-
         if self.ignore_cached or job_state.tries > 0:
             headers['If-None-Match'] = None
             headers['If-Modified-Since'] = email.utils.formatdate(0)
             headers['Cache-Control'] = 'max-age=172800'
             headers['Expires'] = email.utils.formatdate()
+        elif job_state.old_data is not None:
+            # Only send conditional headers if this filter configuration has
+            # a baseline. A newly seen configuration must not reuse the
+            # conditional headers stored for another configuration, otherwise
+            # the server could answer with a 304 before a baseline exists.
+            if job_state.etag is not None:
+                headers['If-None-Match'] = job_state.etag
+
+            if job_state.timestamp is not None:
+                headers['If-Modified-Since'] = email.utils.formatdate(job_state.timestamp)
 
         if self.data is not None:
             if self.method is None:

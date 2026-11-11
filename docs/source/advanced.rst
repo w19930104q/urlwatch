@@ -364,6 +364,80 @@ testing the diff filter if only a single version of the page has been
 retrieved.
 
 
+.. _per_configuration_baselines:
+
+Keeping separate baselines per filter configuration
+----------------------------------------------------
+
+Normally, every job keeps a single change-detection baseline. Changing the
+job's ``filter`` chain (or its ``encoding``) therefore makes the next run look
+like a change, and switching back to an earlier filter configuration cannot
+restore the baseline that was in effect at that time.
+
+Setting ``filter_config_baselines: true`` on a ``url`` job makes urlwatch keep
+a separate baseline -- body, validator (``ETag``/``Last-Modified``), retry
+counter and ``compared_versions`` history -- for each filter configuration:
+
+.. code-block:: yaml
+
+   url: https://example.com/
+   filter_config_baselines: true
+   filter:
+     - html2text
+     - grep: "Current.*version"
+
+The feature is **disabled by default** and is only available for ``url`` jobs
+stored in the default MiniDB (SQLite) cache. The cache-directory and Redis
+backends, as well as ``shell`` and ``browser`` jobs, keep the legacy single
+baseline behavior.
+
+How configurations are distinguished
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A configuration identifier is derived from the effective filter chain and the
+job's ``encoding`` only:
+
+* Equivalent spellings of the same filter chain belong to the same
+  configuration: the legacy string form (``grep:foo,html2text``) is equivalent
+  to the list/dict form (``- grep: {re: foo}`` followed by ``- html2text``),
+  unnamed/default subfilters are mapped to their canonical names, and the
+  order in which subfilter parameters are written does not matter.
+* The order of the filters in the chain **is** significant. Re-ordering
+  filters creates a new configuration, because the processed output can
+  differ.
+* Changing ``encoding`` creates a new configuration.
+* The job's ``name`` and ``tags`` do not participate, so renaming a job or
+  re-tagging it does not start a new baseline.
+
+Behavior on first use, switching back and failures
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+* The first time a configuration is used, no conditional headers
+  (``If-None-Match``/``If-Modified-Since``) are sent; the successful response
+  is stored as that configuration's baseline and reported as ``NEW`` (subject
+  to ``treat_new_as_changed``).
+* When the filter configuration is changed, the new configuration starts with
+  its own, empty baseline. Switching back to a previously used configuration
+  restores that configuration's body, validator, retry counter and
+  ``compared_versions`` history. An HTTP ``304 Not Modified`` only reuses the
+  result of the configuration that sent the conditional headers.
+* A filtering or request failure never overwrites a configuration's last
+  successful baseline and cannot pollute another configuration: the failed
+  run is recorded against the active configuration only, preserving the
+  previous body, and a later successful run resets the retry counter.
+
+Compatibility
+~~~~~~~~~~~~~
+
+The job's GUID is unchanged, and cache entries written by older urlwatch
+versions (as well as entries written while the feature is disabled) remain
+readable: they are stored without a configuration identifier and keep using
+the single shared baseline. Enabling the feature later does not delete those
+entries; each configuration simply starts a new baseline on its first run.
+Garbage collection (``--gc-cache``) retains the latest snapshots of every
+configuration of a job, so baselines remain available when switching back.
+
+
 Monitoring the same URL in multiple jobs
 ----------------------------------------
 

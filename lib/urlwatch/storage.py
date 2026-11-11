@@ -31,6 +31,7 @@
 import os
 import stat
 import copy
+import hashlib
 import platform
 import collections
 from abc import ABCMeta, abstractmethod
@@ -238,6 +239,30 @@ def get_current_user():
         # cron, or by a systemd.service for example, os.getlogin() fails with:
         # OSError: [Errno 25] Inappropriate ioctl for device
         return pwd.getpwuid(os.getuid()).pw_name
+
+
+def get_job_config_id(job):
+    """Stable identifier of the effective filter configuration of a job.
+
+    Only the effective filter chain (after normalization, so equivalent
+    string/list spellings and subfilter parameter order map to the same
+    identifier) and the job's character encoding setting are taken into
+    account. The filter chain order is significant. The job's name and
+    tags do not participate.
+
+    Returns None if per-configuration baselines are not enabled for the
+    job, in which case the cache behaves exactly as before (single
+    baseline per GUID).
+    """
+    if not isinstance(job, UrlJob) or not getattr(job, 'filter_config_baselines', False):
+        return None
+
+    canonical = (
+        FilterBase.canonical_filter_chain(job.filter),
+        getattr(job, 'encoding', None),
+    )
+    digest = hashlib.sha1(repr(canonical).encode('utf-8')).hexdigest()
+    return 'cfg-' + digest
 
 
 class BaseStorage(metaclass=ABCMeta):
@@ -452,6 +477,11 @@ class UrlsTxt(BaseTxtFileStorage, UrlsBaseFileStorage):
 
 
 class CacheStorage(BaseFileStorage, metaclass=ABCMeta):
+    # Whether this backend keeps separate baselines per filter configuration
+    # (see get_job_config_id()). Backends that do not support it silently keep
+    # a single baseline per GUID regardless of the requested configuration.
+    supports_config_baselines = False
+
     @abstractmethod
     def close(self):
         ...
@@ -461,11 +491,11 @@ class CacheStorage(BaseFileStorage, metaclass=ABCMeta):
         ...
 
     @abstractmethod
-    def load(self, job, guid):
+    def load(self, job, guid, config_id=None):
         ...
 
     @abstractmethod
-    def save(self, job, guid, data, timestamp, tries, etag=None):
+    def save(self, job, guid, data, timestamp, tries, etag=None, config_id=None):
         ...
 
     @abstractmethod
@@ -473,7 +503,7 @@ class CacheStorage(BaseFileStorage, metaclass=ABCMeta):
         ...
 
     @abstractmethod
-    def clean(self, guid, retain_limit=1):
+    def clean(self, guid, retain_limit=1, config_id=None):
         ...
 
     @abstractmethod
@@ -518,7 +548,7 @@ class CacheDirStorage(CacheStorage):
     def get_guids(self):
         return os.listdir(self.filename)
 
-    def load(self, job, guid):
+    def load(self, job, guid, config_id=None):
         filename = self._get_filename(guid)
         if not os.path.exists(filename):
             return None, None, None, None
@@ -534,7 +564,7 @@ class CacheDirStorage(CacheStorage):
 
         return data, timestamp, None, None
 
-    def save(self, job, guid, data, timestamp, tries, etag=None):
+    def save(self, job, guid, data, timestamp, tries, etag=None, config_id=None):
         # Timestamp, tries and ETag are always ignored
         filename = self._get_filename(guid)
         with open(filename, 'w+') as fp:
@@ -545,7 +575,7 @@ class CacheDirStorage(CacheStorage):
         if os.path.exists(filename):
             os.unlink(filename)
 
-    def clean(self, guid, retain_limit=1):
+    def clean(self, guid, retain_limit=1, config_id=None):
         # We only store the latest version, no need to clean
         return 0
 
@@ -562,9 +592,16 @@ class CacheEntry(minidb.Model):
     data = str
     tries = int
     etag = str
+    # Identifier of the filter configuration that produced this entry
+    # (see get_job_config_id()). None for entries written by older urlwatch
+    # versions or with per-configuration baselines disabled.
+    config_id = str
 
 
 class CacheMiniDBStorage(CacheStorage):
+    # Only the MiniDB backend keeps separate baselines per filter configuration
+    supports_config_baselines = True
+
     def __init__(self, filename):
         super().__init__(filename)
 
@@ -584,26 +621,41 @@ class CacheMiniDBStorage(CacheStorage):
     def get_guids(self):
         return (guid for guid, in CacheEntry.query(self.db, minidb.Function('distinct', CacheEntry.c.guid)))
 
-    def load(self, job, guid):
+    @staticmethod
+    def _config_id_where(config_id):
+        if config_id is None:
+            return CacheEntry.c.config_id == None  # noqa:E711
+        return CacheEntry.c.config_id == config_id
+
+    def load(self, job, guid, config_id=None):
+        where = (CacheEntry.c.guid == guid) & self._config_id_where(config_id)
+        # The primary key is the final authority for recency: when several
+        # rows share a timestamp (e.g. a failed retry saved within the same
+        # second as the previous successful snapshot), the most recently
+        # written row must win. timestamp/tries ordering is kept for older
+        # databases whose ids do not reflect the insertion order.
         for data, timestamp, tries, etag in CacheEntry.query(self.db,
                                                              CacheEntry.c.data // CacheEntry.c.timestamp
                                                              // CacheEntry.c.tries // CacheEntry.c.etag,
-                                                             order_by=minidb.columns(CacheEntry.c.timestamp.desc,
+                                                             order_by=minidb.columns(CacheEntry.c.id.desc,
+                                                                                     CacheEntry.c.timestamp.desc,
                                                                                      CacheEntry.c.tries.desc),
-                                                             where=CacheEntry.c.guid == guid, limit=1):
+                                                             where=where, limit=1):
             return data, timestamp, tries, etag
 
         return None, None, 0, None
 
-    def get_history_data(self, guid, count=1):
+    def get_history_data(self, guid, count=1, config_id=None):
         history = {}
         if count < 1:
             return history
+        where = ((CacheEntry.c.guid == guid)
+                 & ((CacheEntry.c.tries == 0) | (CacheEntry.c.tries == None))  # noqa:E711
+                 & self._config_id_where(config_id))
         for data, timestamp in CacheEntry.query(self.db, CacheEntry.c.data // CacheEntry.c.timestamp,
                                                 order_by=minidb.columns(CacheEntry.c.timestamp.desc,
                                                                         CacheEntry.c.tries.desc),
-                                                where=(CacheEntry.c.guid == guid)
-                                                & ((CacheEntry.c.tries == 0) | (CacheEntry.c.tries == None))):  # noqa:E711
+                                                where=where):
             if data not in history:
                 history[data] = timestamp
                 if len(history) >= count:
@@ -619,31 +671,55 @@ class CacheMiniDBStorage(CacheStorage):
                                                                 ))
         return guid in self._cached_has_history_data_set
 
-    def save(self, job, guid, data, timestamp, tries, etag=None):
-        self.db.save(CacheEntry(guid=guid, timestamp=timestamp, data=data, tries=tries, etag=etag))
+    def save(self, job, guid, data, timestamp, tries, etag=None, config_id=None):
+        self.db.save(CacheEntry(guid=guid, timestamp=timestamp, data=data, tries=tries,
+                                etag=etag, config_id=config_id))
         self.db.commit()
 
     def delete(self, guid):
         CacheEntry.delete_where(self.db, CacheEntry.c.guid == guid)
         self.db.commit()
 
-    def clean(self, guid, retain_limit=1):
-        retain_limit = max(1, retain_limit)
+    def _get_config_ids(self, guid):
+        return [row[0] for row in CacheEntry.query(
+            self.db, minidb.Function('distinct', CacheEntry.c.config_id),
+            where=CacheEntry.c.guid == guid)]
+
+    def _clean_partition(self, guid, config_id, retain_limit):
+        where = (CacheEntry.c.guid == guid) & self._config_id_where(config_id)
         keep_ids = [row[0] for row in CacheEntry.query(
-            self.db, CacheEntry.c.id, where=CacheEntry.c.guid == guid,
+            self.db, CacheEntry.c.id, where=where,
             order_by=CacheEntry.c.timestamp.desc, limit=retain_limit)]
-        # If nothing's returned from the query, the given guid is not in the db
+        # If nothing's returned from the query, this partition has no entries
         # and no action is needed.
-        if keep_ids:
-            where_clause = CacheEntry.c.guid == guid
-            for keep_id in keep_ids:
-                where_clause = where_clause & (CacheEntry.c.id != keep_id)
-            result = CacheEntry.delete_where(self.db, where_clause)
-            self.db.commit()
-            self.db.vacuum()
+        if not keep_ids:
+            return 0
+
+        for keep_id in keep_ids:
+            where = where & (CacheEntry.c.id != keep_id)
+        result = CacheEntry.delete_where(self.db, where)
+        return result
+
+    def clean(self, guid, retain_limit=1, config_id=None):
+        retain_limit = max(1, retain_limit)
+        if config_id is not None:
+            result = self._clean_partition(guid, config_id, retain_limit)
+            if result:
+                self.db.commit()
+                self.db.vacuum()
             return result
 
-        return 0
+        # Keep the latest snapshots of each filter configuration, so that
+        # switching back to a previously used configuration can restore its
+        # baseline. Entries without a config_id (legacy or feature disabled)
+        # form their own partition.
+        total_removed = 0
+        for partition_config_id in self._get_config_ids(guid):
+            total_removed += self._clean_partition(guid, partition_config_id, retain_limit)
+        if total_removed:
+            self.db.commit()
+            self.db.vacuum()
+        return total_removed
 
     def move(self, guid, new_guid):
         total_moved = 0
@@ -681,7 +757,7 @@ class CacheRedisStorage(CacheStorage):
             guids.append(guid[len('guid:'):].decode())
         return guids
 
-    def load(self, job, guid):
+    def load(self, job, guid, config_id=None):
         key = self._make_key(guid)
         data = self.db.lindex(key, 0)
 
@@ -691,7 +767,7 @@ class CacheRedisStorage(CacheStorage):
 
         return None, None, 0, None
 
-    def get_history_data(self, guid, count=1):
+    def get_history_data(self, guid, count=1, config_id=None):
         history = {}
         if count < 1:
             return history
@@ -710,7 +786,7 @@ class CacheRedisStorage(CacheStorage):
     def has_history_data(self, guid):
         return bool(self.get_history_data(guid))
 
-    def save(self, job, guid, data, timestamp, tries, etag=None):
+    def save(self, job, guid, data, timestamp, tries, etag=None, config_id=None):
         r = {
             'data': data,
             'timestamp': timestamp,
@@ -722,7 +798,7 @@ class CacheRedisStorage(CacheStorage):
     def delete(self, guid):
         self.db.delete(self._make_key(guid))
 
-    def clean(self, guid, retain_limit=1):
+    def clean(self, guid, retain_limit=1, config_id=None):
         retain_limit = max(1, retain_limit)
         key = self._make_key(guid)
         i = self.db.llen(key)

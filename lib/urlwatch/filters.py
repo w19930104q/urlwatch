@@ -182,6 +182,39 @@ class FilterBase(object, metaclass=TrackSubClasses):
                     yield filter_kind, subfilter
 
     @classmethod
+    def canonical_filter_chain(cls, filter_spec):
+        """Return a canonical, hashable representation of a filter chain.
+
+        Equivalent ways of specifying the same chain (legacy string syntax,
+        list/dict syntax, default subfilter mapping, ordering of subfilter
+        parameters) produce the same result, while the order of filters in
+        the chain is preserved (re-ordering filters must be distinguished).
+        """
+        chain = []
+        if not filter_spec:
+            # Jobs without a filter (the default) have an empty chain.
+            return tuple()
+        # Go through normalize_filter_list() so that unknown filter kinds and
+        # unsupported subfilters are rejected exactly as during processing.
+        for filter_kind, subfilter in cls.normalize_filter_list(filter_spec):
+            if isinstance(subfilter, dict):
+                # Sort subfilter parameters so that mapping order does not matter
+                canonical_subfilter = tuple(sorted(
+                    (key, cls._canonical_value(value)) for key, value in subfilter.items()))
+            else:
+                canonical_subfilter = cls._canonical_value(subfilter)
+            chain.append((filter_kind, canonical_subfilter))
+        return tuple(chain)
+
+    @classmethod
+    def _canonical_value(cls, value):
+        if isinstance(value, dict):
+            return tuple(sorted((key, cls._canonical_value(item)) for key, item in value.items()))
+        if isinstance(value, (list, tuple)):
+            return tuple(cls._canonical_value(item) for item in value)
+        return value
+
+    @classmethod
     def process(cls, filter_kind, subfilter, state, data):
         logger.info('Applying filter %r, subfilter %r to %s', filter_kind, subfilter, state.job.get_location())
         filtercls = cls.__subclasses__.get(filter_kind, None)

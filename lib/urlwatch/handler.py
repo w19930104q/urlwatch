@@ -42,6 +42,7 @@ import email.utils
 from .filters import FilterBase
 from .jobs import NotModifiedError
 from .reporters import ReporterBase
+from .storage import get_job_config_id
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +64,14 @@ class JobState(object):
         self.etag = None
         self.error_ignored = False
         self._generated_diff = None
+        # Per-filter-configuration baseline identifier. Only MiniDB-backed
+        # caches support separate baselines; other backends (or the feature
+        # being disabled) get None and keep the legacy single-baseline
+        # behavior.
+        if getattr(cache_storage, 'supports_config_baselines', False):
+            self.config_id = get_job_config_id(job)
+        else:
+            self.config_id = None
 
     def __enter__(self):
         try:
@@ -83,18 +92,21 @@ class JobState(object):
 
     def load(self):
         guid = self.job.get_guid()
-        self.old_data, self.timestamp, self.tries, self.etag = self.cache_storage.load(self.job, guid)
+        self.old_data, self.timestamp, self.tries, self.etag = self.cache_storage.load(
+            self.job, guid, config_id=self.config_id)
         if self.tries is None:
             self.tries = 0
         if self.job.compared_versions and self.job.compared_versions > 1:
-            self.history_data = self.cache_storage.get_history_data(guid, self.job.compared_versions)
+            self.history_data = self.cache_storage.get_history_data(
+                guid, self.job.compared_versions, config_id=self.config_id)
 
     def save(self):
         if self.new_data is None and self.exception is not None:
             # If no new data has been retrieved due to an exception, use the old job data
             self.new_data = self.old_data
 
-        self.cache_storage.save(self.job, self.job.get_guid(), self.new_data, time.time(), self.tries, self.etag)
+        self.cache_storage.save(self.job, self.job.get_guid(), self.new_data, time.time(), self.tries,
+                                self.etag, config_id=self.config_id)
 
     def process(self):
         logger.info('Processing: %s', self.job)

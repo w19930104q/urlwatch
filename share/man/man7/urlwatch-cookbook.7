@@ -482,6 +482,78 @@ treat_new_as_changed: true
 This option will also change the behavior of \fB\-\-test\-diff\-filter\fP, and allow
 testing the diff filter if only a single version of the page has been
 retrieved.
+.SH KEEPING SEPARATE BASELINES PER FILTER CONFIGURATION
+.sp
+Normally, every job keeps a single change\-detection baseline. Changing the job\(aqs
+\fBfilter\fP chain (or its \fBencoding\fP) therefore makes the next run look like a
+change, and switching back to an earlier filter configuration cannot restore the
+baseline that was in effect at that time.
+.sp
+Setting \fBfilter_config_baselines: true\fP on a \fBurl\fP job makes urlwatch keep a
+separate baseline \-\- body, validator (\fBETag\fP/\fBLast\-Modified\fP), retry counter and
+\fBcompared_versions\fP history \-\- for each filter configuration:
+.INDENT 0.0
+.INDENT 3.5
+.sp
+.nf
+.ft C
+url: https://example.com/
+filter_config_baselines: true
+filter:
+  \- html2text
+  \- grep: "Current.*version"
+.ft P
+.fi
+.UNINDENT
+.UNINDENT
+.sp
+The feature is \fBdisabled by default\fP and is only available for \fBurl\fP jobs stored
+in the default MiniDB (SQLite) cache. The cache\-directory and Redis backends, as
+well as \fBshell\fP and \fBbrowser\fP jobs, keep the legacy single baseline behavior.
+.SS How configurations are distinguished
+.sp
+A configuration identifier is derived from the effective filter chain and the
+job\(aqs \fBencoding\fP only:
+.IP \(bu 2
+Equivalent spellings of the same filter chain belong to the same
+configuration: the legacy string form (\fBgrep:foo,html2text\fP) is equivalent to the
+list/dict form (\fBgrep\fP with \fBre: foo\fP followed by \fBhtml2text\fP), unnamed/default
+subfilters are mapped to their canonical names, and the order in which
+subfilter parameters are written does not matter.
+.IP \(bu 2
+The order of the filters in the chain \fIis\fP significant. Re\-ordering filters
+creates a new configuration, because the processed output can differ.
+.IP \(bu 2
+Changing \fBencoding\fP creates a new configuration.
+.IP \(bu 2
+The job\(aqs \fBname\fP and \fBtags\fP do not participate, so renaming a job or re\-tagging
+it does not start a new baseline.
+.SS Behavior on first use, switching back and failures
+.IP \(bu 2
+The first time a configuration is used, no conditional headers
+(\fBIf\-None\-Match\fP/\fBIf\-Modified\-Since\fP) are sent; the successful response is stored
+as that configuration\(aqs baseline and reported as \fBNEW\fP (subject to
+\fBtreat_new_as_changed\fP).
+.IP \(bu 2
+When the filter configuration is changed, the new configuration starts with
+its own, empty baseline. Switching back to a previously used configuration
+restores that configuration\(aqs body, validator, retry counter and
+\fBcompared_versions\fP history. An HTTP \fB304 Not Modified\fP only reuses the result of
+the configuration that sent the conditional headers.
+.IP \(bu 2
+A filtering or request failure never overwrites a configuration\(aqs last
+successful baseline and cannot pollute another configuration: the failed run is
+recorded against the active configuration only, preserving the previous body,
+and a later successful run resets the retry counter.
+.SS Compatibility
+.sp
+The job\(aqs GUID is unchanged, and cache entries written by older urlwatch versions
+(as well as entries written while the feature is disabled) remain readable: they
+are stored without a configuration identifier and keep using the single shared
+baseline. Enabling the feature later does not delete those entries; each
+configuration simply starts a new baseline on its first run. Garbage collection
+(\fB\-\-gc\-cache\fP) retains the latest snapshots of every configuration of a job, so
+baselines remain available when switching back.
 .SH MONITORING THE SAME URL IN MULTIPLE JOBS
 .sp
 Because urlwatch uses the \fBurl\fP/\fBnavigate\fP (for URL/Browser jobs) and/or
